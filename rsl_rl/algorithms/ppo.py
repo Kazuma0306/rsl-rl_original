@@ -154,14 +154,28 @@ class PPO:
         if self.rnd:
             # Compute the intrinsic rewards
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
+            
+            # 内的報酬の形状が不正（2次元以上）になっていないかチェック change
+            if len(self.intrinsic_rewards.shape) > 1:
+                # 不正な形状（例: [50, 50]）を正しい形状（例: [50]）に強制的に修正
+                self.intrinsic_rewards = self.intrinsic_rewards[:, 0]
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
 
         # Bootstrapping on time outs
         if "time_outs" in extras:
-            self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
-            )
+            #self.transition.rewards += self.gamma * torch.squeeze(
+            #    self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
+            #)
+            
+            # .unsqueeze(1) が不正な形状を引き起こす原因のため、これを削除します。 change
+            # 単純なベクトル同士の要素ごとの掛け算になるように修正します。
+            values = self.transition.values.squeeze()
+            time_outs = extras["time_outs"].to(self.device)
+    
+            # これで、常にベクトル同士の安全な要素ごとの掛け算になる
+            bootstrapped_value = self.gamma * values * time_outs
+            self.transition.rewards += bootstrapped_value
 
         # record the transition
         self.storage.add_transitions(self.transition)

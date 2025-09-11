@@ -91,7 +91,8 @@ class RolloutStorage:
 
         # for reinforcement learning
         if self.training_type == "rl":
-            self.values[self.step].copy_(transition.values)
+            #self.values[self.step].copy_(transition.values) changed
+            self.values[self.step].copy_(transition.values.view(-1, 1))
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             self.mu[self.step].copy_(transition.action_mean)
             self.sigma[self.step].copy_(transition.action_sigma)
@@ -139,7 +140,19 @@ class RolloutStorage:
             # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
             advantage = delta + next_is_not_terminal * gamma * lam * advantage
             # Return: R_t = A(s_t, a_t) + V(s_t)
-            self.returns[step] = advantage + self.values[step]
+            #self.returns[step] = advantage + self.values[step] changed
+            
+            # returnの値を計算
+            return_value = advantage + self.values[step]
+    
+            # もし計算結果の形状が、格納先のバッファの形状と異なっていた場合
+            if return_value.shape != self.returns[step].shape:
+                # 不正な形状（例: [2, 2]）から、最初の列だけを取り出して
+                # 正しい形状（例: [2, 1]）に修正して格納する
+                self.returns[step].copy_(return_value[:, 0].view(-1, 1))
+            else:
+                # 形状が正しければ、そのまま格納する
+                self.returns[step].copy_(return_value)
 
         # Compute the advantages
         self.advantages = self.returns - self.values

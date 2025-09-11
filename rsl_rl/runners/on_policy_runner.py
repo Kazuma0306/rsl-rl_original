@@ -17,6 +17,8 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.utils import resolve_obs_groups, store_code_state
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 class OnPolicyRunner:
@@ -69,8 +71,34 @@ class OnPolicyRunner:
             )
 
         # start learning
-        obs = self.env.get_observations().to(self.device)
+        #obs = self.env.get_observations().to(self.device) 
+        # on_policy_runner.py の learn メソッド冒頭 changed
+        obs = self.env.get_observations()
+        # obsの型をチェック
+        if isinstance(obs, dict):
+            # 辞書の場合は、各要素をデバイスに送る
+            obs = {key: value.to(self.device) for key, value in obs.items()}
+        else:
+            # 辞書でない（テンソルの）場合は、そのままデバイスに送る
+            obs = obs.to(self.device)
+    
         self.train_mode()  # switch to train mode (for dropout for example)
+
+
+        # ==============================================================================
+        # ▼▼▼ Matplotlibリアルタイムプロット初期化 ▼▼▼
+        # ==============================================================================
+        # 画面表示を有効にするかどうかのフラグ
+        VISUALIZE_CAMERA = False  # デバッグが終わったらFalseにしてください
+        if VISUALIZE_CAMERA:
+            print("リアルタイムカメラ表示が有効です。")
+            plt.ion()  # インタラクティブモードをON
+            fig, ax = plt.subplots()
+            # 画像サイズを適切に設定してください (例: 64x64)
+            img_plot = ax.imshow(np.zeros((64, 64)), cmap='gray', vmin=0.1, vmax=10.0) 
+            plt.title("Real-time Camera View")
+        # ==============================================================================
+
 
         # Book keeping
         ep_infos = []
@@ -104,7 +132,44 @@ class OnPolicyRunner:
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    #obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    
+                    # 報酬と完了フラグは先にデバイスに転送 changed
+                    rewards, dones = rewards.to(self.device), dones.to(self.device)
+                    # obsの型をチェックして、処理を分岐
+                    if isinstance(obs, dict):
+                        obs = {key: value.to(self.device) for key, value in obs.items()}
+                    else:
+                        obs = obs.to(self.device)
+
+                    # ==============================================================================
+                    # ▼▼▼ Matplotlibリアルタイムプロット更新 ▼▼▼
+                    # ==============================================================================
+                    if VISUALIZE_CAMERA:
+                        # obs辞書から視覚データを取得 (キー名はご自身の環境に合わせてください)
+                        # 例としてキー名を 'depth' と仮定します
+                        image_tensor = obs['camera_image'] 
+                        
+                        # 0番目の環境の画像を取得し、CPUに移動してNumpy配列に変換
+                        image_data = image_tensor[0].cpu().numpy()
+                        
+                        # 画像の形状を整形 (例: (H, W, 1) -> (H, W))
+                        if image_data.shape[-1] == 1:
+                            image_data = image_data.squeeze(-1)
+
+                        normalized_image = (image_data - 0.2) / (3.0 - 0.2)
+                        normalized_image = np.clip(normalized_image, 0, 1)
+
+                        # ★ 10段階に量子化してコントラストを強調 ★
+                        posterized_image = np.round(normalized_image * 10) / 10.0
+                        
+                        # プロットの画像データを更新して再描画
+                        img_plot.set_data(image_data)
+                        fig.canvas.draw()
+                        fig.canvas.flush_events()
+                    # ==============================================================================
+
+                        
                     # process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards (only for logging)
@@ -413,12 +478,23 @@ class OnPolicyRunner:
                 self.policy_cfg["actor_obs_normalization"] = self.cfg["empirical_normalization"]
             if self.policy_cfg.get("critic_obs_normalization") is None:
                 self.policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
+                
 
         # initialize the actor-critic
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))
+        #actor_critic_class = eval(self.policy_cfg.pop("class_name"))
+        
+        class_name_or_obj = self.policy_cfg.pop("class_name") #changed
+        if isinstance(class_name_or_obj, str):
+            # 値が文字列なら、従来通りeval()を使う
+            actor_critic_class = eval(class_name_or_obj)
+        else:
+            # 文字列でなければ（クラスオブジェクトなら）、それをそのまま使う
+            actor_critic_class = class_name_or_obj
+        
         actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
+        
 
         # initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))

@@ -135,6 +135,7 @@ class ActorCritic(nn.Module):
         return torch.cat(obs_list, dim=-1)
 
     def get_critic_obs(self, obs):
+    
         obs_list = []
         for obs_group in self.obs_groups["critic"]:
             obs_list.append(obs[obs_group])
