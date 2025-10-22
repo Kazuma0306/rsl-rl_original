@@ -21,6 +21,71 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+import math
+
+# 好みで設定
+DECAY_ITERS = 800      
+DECAY_PROG_ITERS  = 800 
+W0_MOVE        = 1.0    # 初期重み（平地は1.0推奨）
+W0_PROG           = 1.0
+W_PROG_FLOOR      = 0.3  
+USE_COSINE     = True   # True: コサイン, False: 線形
+
+def _set_move_dir_weight(env, w: float):
+    """
+    環境が VecEnv / ラッパ でもなるべく届くように雑に当てにいくヘルパ。
+    RewardsCfg のキー名 'move_dir_early' と一致させてください。
+    """
+    def _try_set(e):
+        # 1) reward_manager.get_term 形式
+        try:
+            e.reward_manager.get_term("move_dir_early").weight = float(w); return True
+        except Exception:
+            pass
+        # 2) 直接 terms 辞書を触る
+        try:
+            e.reward_manager.terms["move_dir_early"].weight = float(w); return True
+        except Exception:
+            pass
+        return False
+
+    # そのまま
+    if hasattr(env, "reward_manager") and _try_set(env):
+        return
+    # ラップされている場合の典型
+    for attr in ("env", "unwrapped", "venv"):
+        if hasattr(env, attr):
+            e = getattr(env, attr)
+            if hasattr(e, "reward_manager") and _try_set(e):
+                return
+    # ベクトル環境
+    if hasattr(env, "envs"):
+        for e in env.envs:
+            if hasattr(e, "reward_manager") and _try_set(e):
+                return
+
+
+def _set_term_weight(env, term_name: str, w: float):
+    def _try_set(e):
+        try:
+            e.reward_manager.get_term(term_name).weight = float(w); return True
+        except Exception:
+            pass
+        try:
+            e.reward_manager.terms[term_name].weight = float(w); return True
+        except Exception:
+            pass
+        return False
+
+    if hasattr(env, "reward_manager") and _try_set(env): return
+    for attr in ("env", "unwrapped", "venv"):
+        if hasattr(env, attr) and hasattr(getattr(env, attr), "reward_manager"):
+            if _try_set(getattr(env, attr)): return
+    if hasattr(env, "envs"):
+        for e in env.envs:
+            if hasattr(e, "reward_manager") and _try_set(e): return
+
+
 class OnPolicyRunner:
     """On-policy runner for training and evaluation of actor-critic methods."""
 
@@ -125,6 +190,24 @@ class OnPolicyRunner:
         for it in range(start_iter, tot_iter):
             start = time.time()
             # Rollout
+
+            #  #★ 進捗率 t を計算（0→1）
+            # t_raw = (it - start_iter) / max(1, int(DECAY_ITERS))
+            # t_prog = min(1.0, max(0.0, (it - start_iter)/max(1, DECAY_PROG_ITERS)))
+
+            # t  = min(1.0, max(0.0, t_raw))
+            # # ★ 重み w を決定（コサイン or 線形）
+            # w = W0_MOVE * (0.5 * (1.0 + math.cos(math.pi * t)) if USE_COSINE else (1.0 - t))
+
+            # decay = (lambda t: 0.5*(1.0+math.cos(math.pi*t))) if USE_COSINE else (lambda t: 1.0-t)
+
+            # w_prog = W_PROG_FLOOR + (W0_PROG - W_PROG_FLOOR)*decay(t_prog)
+            # # ★ 環境に反映（RewardsCfg のキー名は 'move_dir_early' であること）
+            # _set_move_dir_weight(self.env, w)
+            # _set_term_weight(self.env, "progress_potential_rel", w_prog)
+
+
+
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
