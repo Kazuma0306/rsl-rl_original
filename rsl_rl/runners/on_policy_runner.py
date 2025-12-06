@@ -23,6 +23,28 @@ import numpy as np
 
 import math
 
+
+# 例: env.step() 内や、別のデバッグスクリプトから呼ぶ感じ
+import os
+import matplotlib.pyplot as plt
+import torch
+
+def dump_heightmap(heightmap: torch.Tensor, H: int, W: int,
+                   save_dir: str, env_index: int = 0, step: int = 0):
+    os.makedirs(save_dir, exist_ok=True)
+    hm = heightmap[env_index].view(H, W).detach().cpu().numpy()
+
+    plt.figure()
+    # origin="lower" にしてロボット前方が上になるように
+    im = plt.imshow(hm, origin="lower")
+    plt.colorbar(im, label="height [m]")
+    plt.title(f"env {env_index}, step {step}")
+    plt.savefig(os.path.join(save_dir, f"heightmap_e{env_index}_s{step:06d}.png"),
+                bbox_inches="tight")
+    plt.close()
+
+
+
 # 好みで設定
 DECAY_ITERS = 800      
 DECAY_PROG_ITERS  = 800 
@@ -228,29 +250,50 @@ class OnPolicyRunner:
                     # ==============================================================================
                     # ▼▼▼ Matplotlibリアルタイムプロット更新 ▼▼▼
                     # ==============================================================================
-                    if VISUALIZE_CAMERA:
-                        # obs辞書から視覚データを取得 (キー名はご自身の環境に合わせてください)
-                        # 例としてキー名を 'depth' と仮定します
-                        image_tensor = obs['camera_image'] 
+                    # if VISUALIZE_CAMERA:
+                    #     # obs辞書から視覚データを取得 (キー名はご自身の環境に合わせてください)
+                    #     # 例としてキー名を 'depth' と仮定します
+                    #     image_tensor = obs['camera_image'] 
                         
-                        # 0番目の環境の画像を取得し、CPUに移動してNumpy配列に変換
-                        image_data = image_tensor[0].cpu().numpy()
+                    #     # 0番目の環境の画像を取得し、CPUに移動してNumpy配列に変換
+                    #     image_data = image_tensor[0].cpu().numpy()
                         
-                        # 画像の形状を整形 (例: (H, W, 1) -> (H, W))
-                        if image_data.shape[-1] == 1:
-                            image_data = image_data.squeeze(-1)
+                    #     # 画像の形状を整形 (例: (H, W, 1) -> (H, W))
+                    #     if image_data.shape[-1] == 1:
+                    #         image_data = image_data.squeeze(-1)
 
-                        normalized_image = (image_data - 0.2) / (3.0 - 0.2)
-                        normalized_image = np.clip(normalized_image, 0, 1)
+                    #     normalized_image = (image_data - 0.2) / (3.0 - 0.2)
+                    #     normalized_image = np.clip(normalized_image, 0, 1)
 
-                        # ★ 10段階に量子化してコントラストを強調 ★
-                        posterized_image = np.round(normalized_image * 10) / 10.0
+                    #     # ★ 10段階に量子化してコントラストを強調 ★
+                    #     posterized_image = np.round(normalized_image * 10) / 10.0
                         
-                        # プロットの画像データを更新して再描画
-                        img_plot.set_data(image_data)
-                        fig.canvas.draw()
-                        fig.canvas.flush_events()
+                    #     # プロットの画像データを更新して再描画
+                    #     img_plot.set_data(image_data)
+                    #     fig.canvas.draw()
+                    #     fig.canvas.flush_events()
                     # ==============================================================================
+
+            
+                    
+                    # raw_obs = self.env.get_observations()   # ← これが ManagerBasedEnv の観測 dict
+
+                    # # あなたの ObservationsCfg は
+                    # #   policy: HighLevelPolicyObsCfg
+                    # # なので heightmap は "policy" グループにいるはず
+                    # hm_flat = raw_obs["policy"]["heightmap"]  # shape: (num_envs, H*W)
+
+                    # # 必要なら reshape
+                    # B, HW = hm_flat.shape
+                    # H_map, W_map = 32, 32  # あなたの depth_heightmap の grid_shape に合わせる
+                    # hm = hm_flat.view(B, H_map, W_map)
+
+                    # # 例: env 0, 現在のステップ it を画像保存
+                    # if it % 100 == 0:
+                    #     dump_heightmap(hm_flat, H_map, W_map,
+                    #                 save_dir=f"{self.log_dir}/heightmaps",
+                    #                 env_index=0, step=it)
+
 
                         
                     # process the step

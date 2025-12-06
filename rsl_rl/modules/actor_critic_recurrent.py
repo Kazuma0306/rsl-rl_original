@@ -58,6 +58,14 @@ class ActorCriticRecurrent(nn.Module):
             assert len(obs[obs_group].shape) == 2, "The ActorCriticRecurrent module only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
 
+
+
+
+        num_actor_obs = 256
+        num_critic_obs = 256
+
+
+
         # actor
         self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)
         self.actor = MLP(rnn_hidden_dim, num_actions, actor_hidden_dims, activation)
@@ -147,17 +155,17 @@ class ActorCriticRecurrent(nn.Module):
         out_mem = self.memory_c(obs, masks, hidden_states).squeeze(0)
         return self.critic(out_mem)
 
-    def get_actor_obs(self, obs):
-        obs_list = []
-        for obs_group in self.obs_groups["policy"]:
-            obs_list.append(obs[obs_group])
-        return torch.cat(obs_list, dim=-1)
+    # def get_actor_obs(self, obs):
+    #     obs_list = []
+    #     for obs_group in self.obs_groups["policy"]:
+    #         obs_list.append(obs[obs_group])
+    #     return torch.cat(obs_list, dim=-1)
 
-    def get_critic_obs(self, obs):
-        obs_list = []
-        for obs_group in self.obs_groups["critic"]:
-            obs_list.append(obs[obs_group])
-        return torch.cat(obs_list, dim=-1)
+    # def get_critic_obs(self, obs):
+    #     obs_list = []
+    #     for obs_group in self.obs_groups["critic"]:
+    #         obs_list.append(obs[obs_group])
+    #     return torch.cat(obs_list, dim=-1)
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)

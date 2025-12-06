@@ -233,6 +233,10 @@ class RolloutStorage:
                 last_was_done[1:] = dones[:-1]
                 last_was_done[0] = True
                 trajectories_batch_size = torch.sum(last_was_done[:, start:stop])
+
+                # if trajectories_batch_size == 0:
+                #     # このミニバッチはスキップ
+                #     continue
                 last_traj = first_traj + trajectories_batch_size
 
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
