@@ -47,7 +47,7 @@ class ActorCritic(nn.Module):
             assert len(obs[obs_group].shape) == 2, "The ActorCritic module only supports 1D observations."
             num_critic_obs += obs[obs_group].shape[-1]
 
-        # actor
+        # # actor
         self.actor = MLP(num_actor_obs, num_actions, actor_hidden_dims, activation)
         # actor observation normalization
         self.actor_obs_normalization = actor_obs_normalization
@@ -57,7 +57,7 @@ class ActorCritic(nn.Module):
             self.actor_obs_normalizer = torch.nn.Identity()
         print(f"Actor MLP: {self.actor}")
 
-        # critic
+        # # critic
         self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
         # critic observation normalization
         self.critic_obs_normalization = critic_obs_normalization

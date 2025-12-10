@@ -61,8 +61,8 @@ class ActorCriticRecurrent(nn.Module):
 
 
 
-        num_actor_obs = 256
-        num_critic_obs = 256
+        num_actor_obs = 128
+        num_critic_obs = 128
 
 
 
