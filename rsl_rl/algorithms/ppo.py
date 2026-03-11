@@ -16,6 +16,65 @@ from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
 
 
+
+
+# grad  check
+def _grad_stats(module):
+    # returns (num_params, num_none, mean_abs, max_abs, l2_norm)
+    n = 0
+    none = 0
+    mean_abs_acc = 0.0
+    max_abs = 0.0
+    l2 = 0.0
+    for p in module.parameters():
+        if not p.requires_grad:
+            continue
+        n += 1
+        if p.grad is None:
+            none += 1
+            continue
+        g = p.grad.detach()
+        mean_abs_acc += g.abs().mean().item()
+        max_abs = max(max_abs, g.abs().max().item())
+        l2 += float(g.pow(2).sum().item())
+    mean_abs = mean_abs_acc / max(1, (n - none))
+    l2 = l2 ** 0.5
+    return n, none, mean_abs, max_abs, l2
+
+
+
+
+def _get_hl_update_mask(obs_batch):
+    # returns float mask (N,) in {0,1}
+    upd = None
+    # TensorDict系: obs_batch["policy"]["hl_update"] をまず試す
+    try:
+        upd = obs_batch["policy"]["hl_update"]
+    except Exception:
+        pass
+    # 直下にある場合も試す
+    if upd is None:
+        try:
+            upd = obs_batch["hl_update"]
+        except Exception:
+            pass
+    
+    if upd is None:
+        raise RuntimeError("hl_update not found in obs_batch. Add 'hl_update' to policy obs_groups.")
+
+    upd = upd.squeeze(-1).to(torch.float32)
+    return (upd > 0.5).to(torch.float32)
+
+
+
+def _masked_mean(x, m, eps=1e-8):
+    # x: (N,), m:(N,) float{0,1}
+    denom = m.sum().clamp_min(eps)
+    return (x * m).sum() / denom
+
+
+
+
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
@@ -313,7 +372,22 @@ class PPO:
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            # surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+
+
+            # --- hl_update mask ---　changed TODO
+            mask_full = _get_hl_update_mask(obs_batch)  # shape (batch_size_after_aug,)
+
+            # Surrogate loss (per-sample -> masked mean)
+            surr_vec = torch.max(surrogate, surrogate_clipped)  # (N,)
+            surrogate_loss = _masked_mean(surr_vec, mask_full)
+
+            # Entropy: あなたの実装は「元サンプルだけ」を使っているので同じく元だけに合わせる
+            mask_orig = mask_full[:original_batch_size]
+            entropy_mean = _masked_mean(entropy_batch, mask_orig)
+
+
 
             # Value function loss
             if self.use_clipped_value_loss:
@@ -326,7 +400,18 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+            # --- hl_update mask ---　changed TODO
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_mean
+
+            if mask_full.sum().item() < 1:
+                surrogate_loss = torch.zeros((), device=self.device)
+                entropy_mean = torch.zeros((), device=self.device)
+                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_mean
+
+
+
 
             # Symmetry loss
             if self.symmetry:
@@ -380,6 +465,27 @@ class PPO:
             # -- For PPO
             self.optimizer.zero_grad()
             loss.backward()
+
+
+            # --- loss.backward() の直後に追加 ---
+            # ac = self.policy  # rsl_rl の PPO だと普通ここ
+            # if not hasattr(self, "_dbg_grad_cnt"):
+            #     self._dbg_grad_cnt = 0
+            # self._dbg_grad_cnt += 1
+            # if self._dbg_grad_cnt % 20 == 0:  # 20回に1回だけ表示
+            #     # 重要：あなたのクラスに actor_core がある前提
+            #     if hasattr(ac, "actor_core"):
+            #         n, none, m, mx, l2 = _grad_stats(ac.actor_core)
+            #         print(f"[GRAD actor_core] n={n} none={none} mean|g|={m:.3e} max|g|={mx:.3e} l2={l2:.3e}")
+            #     if hasattr(ac, "critic"):
+            #         n, none, m, mx, l2 = _grad_stats(ac.critic)
+            #         print(f"[GRAD critic]     n={n} none={none} mean|g|={m:.3e} max|g|={mx:.3e} l2={l2:.3e}")
+            #     if hasattr(ac, "log_std") and ac.log_std.grad is not None:
+            #         print(f"[GRAD log_std]    mean|g|={ac.log_std.grad.abs().mean().item():.3e} val={ac.log_std.data.detach().cpu().numpy()}")
+            #     elif hasattr(ac, "std") and ac.std.grad is not None:
+            #         print(f"[GRAD std]        mean|g|={ac.std.grad.abs().mean().item():.3e} val={ac.std.data.detach().cpu().numpy()}")
+
+
             # -- For RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
