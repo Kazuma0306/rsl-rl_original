@@ -173,6 +173,10 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+        self.terminal_success_mask = None
+        self.terminal_failure_mask = None
+        self.logprob_success_mask = None
+        self.logprob_failure_mask = None
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
         # create rollout storage
@@ -244,14 +248,28 @@ class PPO:
     def compute_returns(self, obs):
         # compute value for the last step
         last_values = self.policy.evaluate(obs).detach()
+        advantage_normalization_mask = None
+        if not self.normalize_advantage_per_mini_batch:
+            try:
+                advantage_normalization_mask = _get_hl_update_mask(self.storage.observations).view_as(self.storage.advantages)
+            except Exception:
+                advantage_normalization_mask = None
         self.storage.compute_returns(
-            last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
+            last_values,
+            self.gamma,
+            self.lam,
+            normalize_advantage=not self.normalize_advantage_per_mini_batch,
+            advantage_normalization_mask=advantage_normalization_mask,
         )
 
     def update(self):  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        delta_log_prob_success_sum = 0.0
+        delta_log_prob_success_count = 0
+        delta_log_prob_failure_sum = 0.0
+        delta_log_prob_failure_count = 0
         # -- RND loss
         if self.rnd:
             mean_rnd_loss = 0
@@ -270,7 +288,7 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # iterate over batches
-        for (
+        for update_idx, (
             obs_batch,
             actions_batch,
             target_values_batch,
@@ -281,7 +299,19 @@ class PPO:
             old_sigma_batch,
             hid_states_batch,
             masks_batch,
-        ) in generator:
+        ) in enumerate(generator):
+
+            terminal_success_mask_batch = None
+            terminal_failure_mask_batch = None
+            success_source_mask = self.logprob_success_mask if self.logprob_success_mask is not None else self.terminal_success_mask
+            failure_source_mask = self.logprob_failure_mask if self.logprob_failure_mask is not None else self.terminal_failure_mask
+            if self.policy.is_recurrent and success_source_mask is not None and failure_source_mask is not None:
+                mini_batch_size = self.storage.num_envs // self.num_mini_batches
+                batch_i = int(update_idx % self.num_mini_batches)
+                start = batch_i * mini_batch_size
+                stop = start + mini_batch_size
+                terminal_success_mask_batch = success_source_mask[:, start:stop]
+                terminal_failure_mask_batch = failure_source_mask[:, start:stop]
 
             # number of augmentations per sample
             # we start with 1 and increase it if we use symmetry augmentation
@@ -293,7 +323,15 @@ class PPO:
             # check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+                    try:
+                        adv_norm_mask = _get_hl_update_mask(obs_batch).view_as(advantages_batch).to(torch.bool)
+                        selected_advantages = advantages_batch[adv_norm_mask]
+                    except Exception:
+                        selected_advantages = advantages_batch.reshape(-1)
+                    if selected_advantages.numel() > 1:
+                        advantages_batch = (advantages_batch - selected_advantages.mean()) / (selected_advantages.std() + 1e-8)
+                    else:
+                        advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
@@ -321,6 +359,20 @@ class PPO:
             # -- actor
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
+            delta_log_prob_batch = (actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)).detach()
+            if terminal_success_mask_batch is not None:
+                success_mask = terminal_success_mask_batch.to(device=delta_log_prob_batch.device, dtype=torch.bool)
+                failure_mask = terminal_failure_mask_batch.to(device=delta_log_prob_batch.device, dtype=torch.bool)
+                if success_mask.shape != delta_log_prob_batch.shape:
+                    success_mask = success_mask.view(delta_log_prob_batch.shape)
+                if failure_mask.shape != delta_log_prob_batch.shape:
+                    failure_mask = failure_mask.view(delta_log_prob_batch.shape)
+                if success_mask.any():
+                    delta_log_prob_success_sum += float(delta_log_prob_batch[success_mask].sum().item())
+                    delta_log_prob_success_count += int(success_mask.sum().item())
+                if failure_mask.any():
+                    delta_log_prob_failure_sum += float(delta_log_prob_batch[failure_mask].sum().item())
+                    delta_log_prob_failure_count += int(failure_mask.sum().item())
             # -- critic
             value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
             # -- entropy
@@ -389,16 +441,20 @@ class PPO:
 
 
 
-            # Value function loss
+            # Value function loss is kept on all physics steps because GAE/returns
+            # are computed from values at every physics step. Masking the critic to
+            # hl_update only leaves the non-decision values poorly trained while
+            # they still enter the advantage recursion.
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                     -self.clip_param, self.clip_param
                 )
                 value_losses = (value_batch - returns_batch).pow(2)
                 value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                value_loss_vec = torch.max(value_losses, value_losses_clipped)
             else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
+                value_loss_vec = (returns_batch - value_batch).pow(2)
+            value_loss = value_loss_vec.mean()
 
             # loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
@@ -406,9 +462,10 @@ class PPO:
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_mean
 
             if mask_full.sum().item() < 1:
-                surrogate_loss = torch.zeros((), device=self.device)
-                entropy_mean = torch.zeros((), device=self.device)
-                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_mean
+                zero_loss = (value_batch * 0.0).sum()
+                surrogate_loss = zero_loss
+                entropy_mean = zero_loss
+                loss = self.value_loss_coef * value_loss
 
 
 
@@ -519,6 +576,12 @@ class PPO:
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_delta_log_prob_success = (
+            delta_log_prob_success_sum / delta_log_prob_success_count if delta_log_prob_success_count > 0 else float("nan")
+        )
+        mean_delta_log_prob_failure = (
+            delta_log_prob_failure_sum / delta_log_prob_failure_count if delta_log_prob_failure_count > 0 else float("nan")
+        )
         # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -533,6 +596,8 @@ class PPO:
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
+            "delta_log_prob_success": mean_delta_log_prob_success,
+            "delta_log_prob_failure": mean_delta_log_prob_failure,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss

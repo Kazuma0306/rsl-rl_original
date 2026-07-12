@@ -108,6 +108,225 @@ def _set_term_weight(env, term_name: str, w: float):
             if hasattr(e, "reward_manager") and _try_set(e): return
 
 
+_STEP_STAT_PREFIXES = (
+    "selected_cell_",
+    "goal_success_",
+    "goal_stop_",
+    "freeze_goal_",
+    "hl_",
+    "fr_hold_",
+    "step_response_",
+    "target_forward_",
+    "target_success_",
+    "touchdown_reward_",
+    "touchdown_success_",
+)
+_STEP_STAT_SKIP_KEYS = {"log", "episode", "observations", "time_outs"}
+
+
+def _ep_info_scalar(ep_info: dict, key: str) -> float | None:
+    if not isinstance(ep_info, dict) or key not in ep_info:
+        return None
+    value = ep_info[key]
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            scalar = float(value.detach().float().mean().cpu().item())
+        elif isinstance(value, (float, int, bool, np.number)):
+            scalar = float(value)
+        else:
+            return None
+    except Exception:
+        return None
+    return scalar if math.isfinite(scalar) else None
+
+
+def _summarize_episode_reward_balance(ep_infos: list[dict]) -> dict[str, float]:
+    """Summarize success bonus vs non-success rewards from episode reset logs.
+
+    IsaacLab's Episode_Reward values are normalized by max_episode_length_s.
+    The absolute scale is therefore per-second-ish, but the bonus/dense ratio is still useful.
+    """
+    rows = []
+    for ep_info in ep_infos:
+        if not isinstance(ep_info, dict):
+            continue
+        success_bonus = _ep_info_scalar(ep_info, "Episode_Reward/success_bonus")
+        if success_bonus is None:
+            success_bonus = 0.0
+
+        dense_signed = 0.0
+        dense_positive = 0.0
+        dense_negative = 0.0
+        dense_terms = 0
+        for key in ep_info:
+            if not key.startswith("Episode_Reward/") or key == "Episode_Reward/success_bonus":
+                continue
+            value = _ep_info_scalar(ep_info, key)
+            if value is None:
+                continue
+            dense_signed += value
+            dense_positive += max(value, 0.0)
+            dense_negative += min(value, 0.0)
+            dense_terms += 1
+
+        success_rate = _ep_info_scalar(ep_info, "Episode_Termination/success")
+        rows.append((success_bonus, dense_signed, dense_positive, dense_negative, float("nan") if success_rate is None else success_rate, dense_terms))
+
+    if not rows:
+        return {}
+
+    n = float(len(rows))
+    success_bonus = sum(row[0] for row in rows) / n
+    dense_signed = sum(row[1] for row in rows) / n
+    dense_positive = sum(row[2] for row in rows) / n
+    dense_negative = sum(row[3] for row in rows) / n
+    success_rates = [row[4] for row in rows if math.isfinite(row[4])]
+    success_rate = sum(success_rates) / max(len(success_rates), 1) if success_rates else float("nan")
+    dense_terms = sum(row[5] for row in rows) / n
+    denom = dense_positive if dense_positive > 1.0e-8 else abs(dense_signed)
+    bonus_over_dense = success_bonus / denom if denom > 1.0e-8 else float("nan")
+    return {
+        "success_bonus": success_bonus,
+        "dense_signed": dense_signed,
+        "dense_positive": dense_positive,
+        "dense_negative": dense_negative,
+        "bonus_over_dense": bonus_over_dense,
+        "success_rate": success_rate,
+        "num_logs": n,
+        "dense_terms": dense_terms,
+    }
+
+
+def _accumulate_step_stats(extras: dict, sums: dict[str, float], counts: dict[str, int]):
+    if not isinstance(extras, dict):
+        return
+
+    def _accumulate_mapping(mapping: dict):
+        for key, value in mapping.items():
+            if key in _STEP_STAT_SKIP_KEYS or not key.startswith(_STEP_STAT_PREFIXES):
+                continue
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 0:
+                    continue
+                try:
+                    scalar = float(value.detach().float().mean().cpu().item())
+                except Exception:
+                    continue
+            elif isinstance(value, (float, int, bool, np.number)):
+                scalar = float(value)
+            else:
+                continue
+            if not math.isfinite(scalar):
+                continue
+            sums[key] = sums.get(key, 0.0) + scalar
+            counts[key] = counts.get(key, 0) + 1
+
+    _accumulate_mapping(extras)
+    for nested_key in ("log", "episode"):
+        nested = extras.get(nested_key)
+        if isinstance(nested, dict):
+            _accumulate_mapping(nested)
+
+
+_TERMINAL_SUCCESS_MASK_KEYS = (
+    "one_step_direct_success_mask",
+    "goal_success_mask",
+    "fr_hold_ok_mask",
+    "all_feet_hold_mask",
+    "active_leg_touchdown_success_mask",
+)
+
+
+def _extract_terminal_success_mask(extras: dict, dones: torch.Tensor, device: torch.device) -> torch.Tensor:
+    done_flat = dones.reshape(-1).to(device=device).bool()
+    if not isinstance(extras, dict):
+        return torch.zeros_like(done_flat)
+    for key in _TERMINAL_SUCCESS_MASK_KEYS:
+        value = extras.get(key)
+        if isinstance(value, torch.Tensor):
+            mask = value.to(device=device).reshape(-1)
+            if mask.numel() >= done_flat.numel():
+                return mask[: done_flat.numel()].bool()
+    return torch.zeros_like(done_flat)
+
+
+def _extract_hl_update_mask_from_obs(obs, device: torch.device) -> torch.Tensor | None:
+    value = None
+    try:
+        value = obs["policy"]["hl_update"]
+    except Exception:
+        pass
+    if value is None:
+        try:
+            value = obs["hl_update"]
+        except Exception:
+            pass
+    if not isinstance(value, torch.Tensor):
+        return None
+    return (value.to(device=device).reshape(-1) > 0.5)
+
+
+def _summarize_outcome_advantages(
+    advantages: torch.Tensor,
+    success_mask: torch.Tensor,
+    failure_mask: torch.Tensor,
+    count: int,
+    *,
+    prefix: str,
+    count_key: str,
+) -> dict[str, float]:
+    adv = advantages.detach().squeeze(-1)
+    success_count = int(success_mask.sum().item())
+    failure_count = int(failure_mask.sum().item())
+
+    def _mean_for(mask: torch.Tensor) -> float:
+        if mask.any():
+            return float(adv[mask].mean().cpu().item())
+        return float("nan")
+
+    return {
+        count_key: float(count),
+        f"{prefix}_success_count": float(success_count),
+        f"{prefix}_failure_count": float(failure_count),
+        f"{prefix}_success_adv_mean": _mean_for(success_mask),
+        f"{prefix}_failure_adv_mean": _mean_for(failure_mask),
+    }
+
+
+def _summarize_terminal_advantages(
+    advantages: torch.Tensor,
+    terminal_success_mask: torch.Tensor,
+    terminal_failure_mask: torch.Tensor,
+    episode_count: int,
+) -> dict[str, float]:
+    return _summarize_outcome_advantages(
+        advantages,
+        terminal_success_mask,
+        terminal_failure_mask,
+        episode_count,
+        prefix="terminal",
+        count_key="episodes_per_iter",
+    )
+
+
+def _summarize_event_advantages(
+    advantages: torch.Tensor,
+    event_success_mask: torch.Tensor,
+    event_failure_mask: torch.Tensor,
+) -> dict[str, float]:
+    event_count = int((event_success_mask | event_failure_mask).sum().item())
+    return _summarize_outcome_advantages(
+        advantages,
+        event_success_mask,
+        event_failure_mask,
+        event_count,
+        prefix="event",
+        count_key="events_per_iter",
+    )
+
+
 class OnPolicyRunner:
     """On-policy runner for training and evaluation of actor-critic methods."""
 
@@ -211,6 +430,16 @@ class OnPolicyRunner:
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+            step_metric_sums = {}
+            step_metric_counts = {}
+            episode_count_iter = 0
+            terminal_success_mask = torch.zeros(
+                self.num_steps_per_env, self.env.num_envs, dtype=torch.bool, device=self.device
+            )
+            terminal_failure_mask = torch.zeros_like(terminal_success_mask)
+            event_success_mask = torch.zeros_like(terminal_success_mask)
+            event_failure_mask = torch.zeros_like(terminal_success_mask)
+            last_hl_event_step = torch.full((self.env.num_envs,), -1, dtype=torch.long, device=self.device)
             # Rollout
 
             #  #★ 進捗率 t を計算（0→1）
@@ -234,6 +463,11 @@ class OnPolicyRunner:
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs)
+                    if self.log_dir is not None:
+                        storage_step = int(self.alg.storage.step)
+                        event_mask = _extract_hl_update_mask_from_obs(obs, self.device)
+                        if event_mask is not None and event_mask.numel() == self.env.num_envs:
+                            last_hl_event_step[event_mask] = storage_step
                     # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
@@ -296,6 +530,25 @@ class OnPolicyRunner:
 
 
                         
+                    if self.log_dir is not None:
+                        _accumulate_step_stats(extras, step_metric_sums, step_metric_counts)
+                        storage_step = int(self.alg.storage.step)
+                        done_mask = dones.reshape(-1).bool()
+                        success_mask = _extract_terminal_success_mask(extras, dones, self.device) & done_mask
+                        terminal_success_mask[storage_step].copy_(success_mask)
+                        terminal_failure_mask[storage_step].copy_(done_mask & ~success_mask)
+                        done_env_ids = done_mask.nonzero(as_tuple=False).reshape(-1)
+                        if done_env_ids.numel() > 0:
+                            event_steps = last_hl_event_step[done_env_ids]
+                            valid_event = event_steps >= 0
+                            if valid_event.any():
+                                env_ids = done_env_ids[valid_event]
+                                event_steps = event_steps[valid_event]
+                                event_success_mask[event_steps, env_ids] = success_mask[env_ids]
+                                event_failure_mask[event_steps, env_ids] = ~success_mask[env_ids]
+                            last_hl_event_step[done_env_ids] = -1
+                        episode_count_iter += int(done_mask.sum().item())
+
                     # process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards (only for logging)
@@ -335,8 +588,23 @@ class OnPolicyRunner:
 
                 # compute returns
                 self.alg.compute_returns(obs)
+                advantage_outcome_stats = _summarize_terminal_advantages(
+                    self.alg.storage.advantages,
+                    terminal_success_mask,
+                    terminal_failure_mask,
+                    episode_count_iter,
+                )
+                advantage_event_stats = _summarize_event_advantages(
+                    self.alg.storage.advantages,
+                    event_success_mask,
+                    event_failure_mask,
+                )
 
             # update policy
+            self.alg.terminal_success_mask = terminal_success_mask
+            self.alg.terminal_failure_mask = terminal_failure_mask
+            self.alg.logprob_success_mask = event_success_mask
+            self.alg.logprob_failure_mask = event_failure_mask
             loss_dict = self.alg.update()
 
             stop = time.time()
@@ -375,6 +643,7 @@ class OnPolicyRunner:
 
         # -- Episode info
         ep_string = ""
+        reward_balance = _summarize_episode_reward_balance(locs.get("ep_infos", []))
         if locs["ep_infos"]:
             for key in locs["ep_infos"][0]:
                 infotensor = torch.tensor([], device=self.device)
@@ -406,6 +675,50 @@ class OnPolicyRunner:
 
         # -- Policy
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+
+        # -- Terminal / event advantage diagnostics
+        advantage_outcome_stats = locs.get("advantage_outcome_stats", {})
+        advantage_event_stats = locs.get("advantage_event_stats", {})
+        if advantage_outcome_stats:
+            self.writer.add_scalar("Train/episodes_per_iter", advantage_outcome_stats["episodes_per_iter"], locs["it"])
+            self.writer.add_scalar(
+                "Advantage/terminal_success_count", advantage_outcome_stats["terminal_success_count"], locs["it"]
+            )
+            self.writer.add_scalar(
+                "Advantage/terminal_failure_count", advantage_outcome_stats["terminal_failure_count"], locs["it"]
+            )
+            for key, tag in (
+                ("terminal_success_adv_mean", "Advantage/terminal_success_mean"),
+                ("terminal_failure_adv_mean", "Advantage/terminal_failure_mean"),
+            ):
+                value = advantage_outcome_stats[key]
+                if math.isfinite(value):
+                    self.writer.add_scalar(tag, value, locs["it"])
+        if advantage_event_stats:
+            self.writer.add_scalar("Train/events_per_iter", advantage_event_stats["events_per_iter"], locs["it"])
+            self.writer.add_scalar(
+                "Advantage/event_success_count", advantage_event_stats["event_success_count"], locs["it"]
+            )
+            self.writer.add_scalar(
+                "Advantage/event_failure_count", advantage_event_stats["event_failure_count"], locs["it"]
+            )
+            for key, tag in (
+                ("event_success_adv_mean", "Advantage/event_success_mean"),
+                ("event_failure_adv_mean", "Advantage/event_failure_mean"),
+            ):
+                value = advantage_event_stats[key]
+                if math.isfinite(value):
+                    self.writer.add_scalar(tag, value, locs["it"])
+
+        # -- Step-level environment statistics
+        step_metric_sums = locs.get("step_metric_sums", {})
+        step_metric_counts = locs.get("step_metric_counts", {})
+        step_metric_means = {}
+        for key in sorted(step_metric_sums):
+            count = max(int(step_metric_counts.get(key, 0)), 1)
+            value = step_metric_sums[key] / count
+            step_metric_means[key] = value
+            self.writer.add_scalar(f"StepStats/{key}", value, locs["it"])
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
@@ -450,6 +763,21 @@ class OnPolicyRunner:
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
             # -- episode info
             log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+            if reward_balance:
+                success_rate = reward_balance["success_rate"]
+                success_rate_str = f"{success_rate:.4f}" if math.isfinite(success_rate) else "nan"
+                ratio = reward_balance["bonus_over_dense"]
+                ratio_str = f"{ratio:.3f}" if math.isfinite(ratio) else "nan"
+                log_string += (
+                    f"""{'Reward balance:':>{pad}} """
+                    f"success_bonus={reward_balance['success_bonus']:.4f}, "
+                    f"dense_signed={reward_balance['dense_signed']:.4f}, "
+                    f"dense_pos={reward_balance['dense_positive']:.4f}, "
+                    f"dense_neg={reward_balance['dense_negative']:.4f}, "
+                    f"bonus/dense_pos={ratio_str}, "
+                    f"success={success_rate_str}, "
+                    f"logs={int(reward_balance['num_logs'])}\n"
+                )
         else:
             log_string = (
                 f"""{'#' * width}\n"""
@@ -462,6 +790,43 @@ class OnPolicyRunner:
                 log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
 
         log_string += ep_string
+        if advantage_outcome_stats:
+            success_adv = advantage_outcome_stats["terminal_success_adv_mean"]
+            failure_adv = advantage_outcome_stats["terminal_failure_adv_mean"]
+            success_adv_str = f"{success_adv:+.4f}" if math.isfinite(success_adv) else "n/a"
+            failure_adv_str = f"{failure_adv:+.4f}" if math.isfinite(failure_adv) else "n/a"
+            log_string += (
+                f"""{'Terminal adv:':>{pad}} """
+                f"episodes/iter={int(advantage_outcome_stats['episodes_per_iter'])}, "
+                f"success_n={int(advantage_outcome_stats['terminal_success_count'])}, "
+                f"failure_n={int(advantage_outcome_stats['terminal_failure_count'])}, "
+                f"success_adv={success_adv_str}, failure_adv={failure_adv_str}\n"
+            )
+        if advantage_event_stats:
+            success_adv = advantage_event_stats["event_success_adv_mean"]
+            failure_adv = advantage_event_stats["event_failure_adv_mean"]
+            success_adv_str = f"{success_adv:+.4f}" if math.isfinite(success_adv) else "n/a"
+            failure_adv_str = f"{failure_adv:+.4f}" if math.isfinite(failure_adv) else "n/a"
+            log_string += (
+                f"""{'Event adv:':>{pad}} """
+                f"events/iter={int(advantage_event_stats['events_per_iter'])}, "
+                f"success_n={int(advantage_event_stats['event_success_count'])}, "
+                f"failure_n={int(advantage_event_stats['event_failure_count'])}, "
+                f"success_adv={success_adv_str}, failure_adv={failure_adv_str}\n"
+            )
+        outcome_metric_parts = []
+        for label, key in (
+            ("Target success rate", "target_success_rate"),
+            ("Touch down success rate", "touchdown_success_rate"),
+        ):
+            if key in step_metric_means:
+                value = step_metric_means[key]
+                self.writer.add_scalar(f"StepStats/{label}", value, locs["it"])
+                outcome_metric_parts.append(f"{label}={value:.4f}")
+            else:
+                outcome_metric_parts.append(f"{label}=n/a")
+        log_string += f"""{'HL outcome:':>{pad}} {', '.join(outcome_metric_parts)}
+"""
         log_string += (
             f"""{'-' * width}\n"""
             f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""

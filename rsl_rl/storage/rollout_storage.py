@@ -125,7 +125,14 @@ class RolloutStorage:
     def clear(self):
         self.step = 0
 
-    def compute_returns(self, last_values, gamma, lam, normalize_advantage: bool = True):
+    def compute_returns(
+        self,
+        last_values,
+        gamma,
+        lam,
+        normalize_advantage: bool = True,
+        advantage_normalization_mask=None,
+    ):
         advantage = 0
         for step in reversed(range(self.num_transitions_per_env)):
             # if we are at the last step, bootstrap the return value
@@ -159,7 +166,21 @@ class RolloutStorage:
         # Normalize the advantages if flag is set
         # This is to prevent double normalization (i.e. if per minibatch normalization is used)
         if normalize_advantage:
-            self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+            if advantage_normalization_mask is not None:
+                mask = advantage_normalization_mask.to(device=self.advantages.device, dtype=torch.bool)
+                if mask.shape != self.advantages.shape:
+                    mask = mask.view(self.advantages.shape)
+                selected_advantages = self.advantages[mask]
+                if selected_advantages.numel() > 1:
+                    mean = selected_advantages.mean()
+                    std = selected_advantages.std()
+                else:
+                    mean = self.advantages.mean()
+                    std = self.advantages.std()
+            else:
+                mean = self.advantages.mean()
+                std = self.advantages.std()
+            self.advantages = (self.advantages - mean) / (std + 1e-8)
 
     # for distillation
     def generator(self):
